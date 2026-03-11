@@ -2,6 +2,11 @@ from typing import Any, TypedDict
 from langgraph.graph import END, StateGraph
 from app.clients.openai_client import get_openai_client
 from app.models.chat import ChatRequest
+from app.observability.langfuse import (
+    create_llm_generation,
+    end_llm_generation_success,
+    end_llm_generation_error,
+)
 
 
 class ChatAgentState(TypedDict, total=False):
@@ -10,9 +15,13 @@ class ChatAgentState(TypedDict, total=False):
     temperature: float | None
     max_tokens: int
     completion: dict[str, Any]
+    trace: Any
 
 
 def _call_llm(state: ChatAgentState) -> ChatAgentState:
+    trace = state.get("trace")
+    generation = create_llm_generation(trace, state["model"], state["messages"])
+
     payload: dict[str, Any] = {
         "model": state["model"],
         "messages": state["messages"],
@@ -22,8 +31,15 @@ def _call_llm(state: ChatAgentState) -> ChatAgentState:
     if state.get("temperature") is not None:
         payload["temperature"] = state["temperature"]
 
-    completion = get_openai_client().chat.completions.create(**payload)
-    return {"completion": completion.model_dump(mode="json")}
+    try:
+        completion = get_openai_client().chat.completions.create(**payload)
+        output = completion.choices[0].message.content
+        usage = completion.usage.model_dump() if completion.usage else {}
+        end_llm_generation_success(generation, output, usage)
+        return {"completion": completion.model_dump(mode="json")}
+    except Exception as exc:
+        end_llm_generation_error(generation, str(exc))
+        raise
 
 
 def _build_chat_agent():
@@ -43,7 +59,7 @@ def initialize_chat_agent() -> None:
         _chat_agent = _build_chat_agent()
 
 
-def run_chat_agent(request: ChatRequest) -> dict[str, Any]:
+def run_chat_agent(request: ChatRequest, trace=None) -> dict[str, Any]:
     global _chat_agent
     if _chat_agent is None:
         initialize_chat_agent()
@@ -53,6 +69,7 @@ def run_chat_agent(request: ChatRequest) -> dict[str, Any]:
         "messages": [{"role": m.role, "content": m.content} for m in request.messages],
         "temperature": request.temperature,
         "max_tokens": request.max_tokens,
+        "trace": trace,
     }
     result = _chat_agent.invoke(state)
     return result["completion"]
