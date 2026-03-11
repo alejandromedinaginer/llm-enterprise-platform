@@ -51,7 +51,7 @@ services:
   # ===========================================================
 
   vllm:
-    image: vllm/vllm-openai:v0.5.4
+    image: vllm/vllm-openai:v0.6.6.post1
     container_name: llm-vllm
     restart: "no"
     profiles:
