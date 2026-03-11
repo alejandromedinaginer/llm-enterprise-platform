@@ -1,45 +1,82 @@
+"""Single-node LangGraph chat agent."""
+
+from time import perf_counter
 from typing import Any, TypedDict
+
 from langgraph.graph import END, StateGraph
+
 from app.clients.openai_client import get_openai_client
 from app.models.chat import ChatRequest
 from app.observability.langfuse import (
     create_llm_generation,
-    end_llm_generation_success,
     end_llm_generation_error,
+    end_llm_generation_success,
 )
 
 
 class ChatAgentState(TypedDict, total=False):
+    provider: str
+    base_url: str
     model: str
     messages: list[dict[str, str]]
     temperature: float | None
-    max_tokens: int
+    max_tokens: int | None
     completion: dict[str, Any]
-    trace: Any
+    trace: Any | None
+
+
+def _extract_usage_details(completion: dict[str, Any]) -> dict[str, int] | None:
+    usage = completion.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    return {
+        key: value
+        for key, value in usage.items()
+        if key in {"prompt_tokens", "completion_tokens", "total_tokens"}
+        and isinstance(value, int)
+    } or None
 
 
 def _call_llm(state: ChatAgentState) -> ChatAgentState:
-    trace = state.get("trace")
-    generation = create_llm_generation(trace, state["model"], state["messages"])
+    start = perf_counter()
+    generation = create_llm_generation(
+        trace=state.get("trace"),
+        provider=state["provider"],
+        base_url=state["base_url"],
+        model=state["model"],
+        messages=state["messages"],
+        temperature=state.get("temperature"),
+        max_tokens=state["max_tokens"],
+    )
 
     payload: dict[str, Any] = {
         "model": state["model"],
         "messages": state["messages"],
-        "max_tokens": state["max_tokens"],
         "stream": False,
     }
+    if state.get("max_tokens") is not None:
+        payload["max_tokens"] = state["max_tokens"]
     if state.get("temperature") is not None:
         payload["temperature"] = state["temperature"]
 
     try:
-        completion = get_openai_client().chat.completions.create(**payload)
-        output = completion.choices[0].message.content
-        usage = completion.usage.model_dump() if completion.usage else {}
-        end_llm_generation_success(generation, output, usage)
-        return {"completion": completion.model_dump(mode="json")}
+        completion = get_openai_client(base_url=state["base_url"]).chat.completions.create(**payload)
     except Exception as exc:
-        end_llm_generation_error(generation, str(exc))
+        end_llm_generation_error(
+            generation=generation,
+            error_message=str(exc),
+            latency_ms=int((perf_counter() - start) * 1000),
+        )
         raise
+
+    completion_json = completion.model_dump(mode="json")
+    end_llm_generation_success(
+        generation=generation,
+        output=completion_json,
+        usage_details=_extract_usage_details(completion_json),
+        latency_ms=int((perf_counter() - start) * 1000),
+    )
+    return {"completion": completion_json}
 
 
 def _build_chat_agent():
@@ -59,12 +96,14 @@ def initialize_chat_agent() -> None:
         _chat_agent = _build_chat_agent()
 
 
-def run_chat_agent(request: ChatRequest, trace=None) -> dict[str, Any]:
+def run_chat_agent(request: ChatRequest, trace: Any | None = None) -> dict[str, Any]:
     global _chat_agent
     if _chat_agent is None:
         initialize_chat_agent()
 
     state: ChatAgentState = {
+        "provider": request.provider,
+        "base_url": request.base_url,
         "model": request.model,
         "messages": [{"role": m.role, "content": m.content} for m in request.messages],
         "temperature": request.temperature,

@@ -1,16 +1,29 @@
+"""Langfuse helpers for best-effort observability."""
+
+from __future__ import annotations
+
 import logging
 from functools import lru_cache
+from typing import Any
+
 from langfuse import Langfuse
+
 from app.core.settings import get_settings
+from app.models.chat import ChatRequest
 
 logger = logging.getLogger(__name__)
+
+
+def _langfuse_enabled() -> bool:
+    settings = get_settings()
+    return bool(settings.langfuse_public_key and settings.langfuse_secret_key)
 
 
 @lru_cache(maxsize=1)
 def get_langfuse_client() -> Langfuse | None:
     settings = get_settings()
-    if not settings.langfuse_secret_key or not settings.langfuse_public_key:
-        logger.warning("Langfuse keys not configured, observability disabled.")
+    if not _langfuse_enabled():
+        logger.warning("Langfuse disabled: LANGFUSE_PUBLIC_KEY/LANGFUSE_SECRET_KEY are missing.")
         return None
     try:
         return Langfuse(
@@ -19,84 +32,149 @@ def get_langfuse_client() -> Langfuse | None:
             host=settings.langfuse_base_url,
         )
     except Exception as exc:
-        logger.warning(f"Failed to initialize Langfuse client: {exc}")
+        logger.warning("Failed to initialize Langfuse client: %s", exc)
         return None
 
 
-def create_chat_trace(trace_id: str, input_messages: list):
-    settings = get_settings()
-    client = get_langfuse_client()
-    if client is None:
-        return None
-    try:
-        return client.trace(
-            id=trace_id,
-            name="chat.completions",
-            input=input_messages,
-            metadata={"environment": settings.langfuse_environment},
-        )
-    except Exception as exc:
-        logger.warning(f"Langfuse create_chat_trace failed: {exc}")
-        return None
-
-
-def create_llm_generation(trace, model: str, input_messages: list):
-    settings = get_settings()
-    if trace is None:
-        return None
-    try:
-        return trace.generation(
-            name="llm.generation",
-            model=model,
-            input=input_messages,
-            metadata={"environment": settings.langfuse_environment},
-        )
-    except Exception as exc:
-        logger.warning(f"Langfuse create_llm_generation failed: {exc}")
-        return None
-
-
-def update_chat_trace_success(trace, output: str, latency: float):
-    if trace is None:
-        return
-    try:
-        trace.update(output=output, metadata={"latency_seconds": latency})
-    except Exception as exc:
-        logger.warning(f"Langfuse update_chat_trace_success failed: {exc}")
-
-
-def update_chat_trace_error(trace, error: str):
-    if trace is None:
-        return
-    try:
-        trace.update(metadata={"error": error})
-    except Exception as exc:
-        logger.warning(f"Langfuse update_chat_trace_error failed: {exc}")
-
-
-def end_llm_generation_success(generation, output: str, usage: dict):
-    if generation is None:
-        return
-    try:
-        generation.end(output=output, usage=usage)
-    except Exception as exc:
-        logger.warning(f"Langfuse end_llm_generation_success failed: {exc}")
-
-
-def end_llm_generation_error(generation, error: str):
-    if generation is None:
-        return
-    try:
-        generation.end(metadata={"error": error})
-    except Exception as exc:
-        logger.warning(f"Langfuse end_llm_generation_error failed: {exc}")
-
-
-def flush_langfuse():
+def flush_langfuse() -> None:
     client = get_langfuse_client()
     if client is None:
         return
     try:
         client.flush()
     except Exception as exc:
-        logger.warning(f"Langfuse flush failed: {exc}")
+        logger.warning("Failed to flush Langfuse events: %s", exc)
+
+
+def create_chat_trace(request: ChatRequest) -> Any | None:
+    client = get_langfuse_client()
+    if client is None:
+        return None
+    settings = get_settings()
+    trace_input = {
+        "provider": request.provider,
+        "base_url": request.base_url,
+        "model": request.model,
+        "messages": [{"role": m.role, "content": m.content} for m in request.messages],
+        "temperature": request.temperature,
+        "max_tokens": request.max_tokens,
+    }
+    try:
+        return client.trace(
+            name="chat.completions",
+            input=trace_input,
+            metadata={
+                "endpoint": "/v1/chat/completions",
+                "provider": request.provider,
+                "base_url": request.base_url,
+            },
+            environment=settings.langfuse_environment,
+        )
+    except Exception as exc:
+        logger.warning("Failed to create Langfuse trace: %s", exc)
+        return None
+
+
+def update_chat_trace_success(
+    trace: Any | None,
+    completion: dict[str, Any],
+    latency_ms: int,
+    provider: str,
+    base_url: str,
+) -> None:
+    if trace is None:
+        return
+    try:
+        trace.update(
+            output=completion,
+            metadata={"status": "success", "latency_ms": latency_ms, "provider": provider, "base_url": base_url},
+        )
+    except Exception as exc:
+        logger.warning("Failed to update Langfuse trace (success): %s", exc)
+
+
+def update_chat_trace_error(
+    trace: Any | None,
+    error_message: str,
+    latency_ms: int,
+    provider: str,
+    base_url: str,
+) -> None:
+    if trace is None:
+        return
+    try:
+        trace.update(
+            metadata={"status": "error", "latency_ms": latency_ms, "provider": provider, "base_url": base_url},
+            output={"error": error_message},
+        )
+    except Exception as exc:
+        logger.warning("Failed to update Langfuse trace (error): %s", exc)
+
+
+def create_llm_generation(
+    trace: Any | None,
+    *,
+    provider: str,
+    base_url: str,
+    model: str,
+    messages: list[dict[str, str]],
+    temperature: float | None,
+    max_tokens: int | None,
+) -> Any | None:
+    if trace is None:
+        return None
+    settings = get_settings()
+    model_parameters: dict[str, Any] = {}
+    if max_tokens is not None:
+        model_parameters["max_tokens"] = max_tokens
+    if temperature is not None:
+        model_parameters["temperature"] = temperature
+    try:
+        return trace.generation(
+            name="llm.generation",
+            model=model,
+            input=messages,
+            model_parameters=model_parameters,
+            metadata={"provider": provider, "base_url": base_url},
+            environment=settings.langfuse_environment,
+        )
+    except Exception as exc:
+        logger.warning("Failed to create Langfuse generation: %s", exc)
+        return None
+
+
+def end_llm_generation_success(
+    generation: Any | None,
+    *,
+    output: dict[str, Any],
+    usage_details: dict[str, int] | None,
+    latency_ms: int,
+) -> None:
+    if generation is None:
+        return
+    try:
+        generation.end(
+            output=output,
+            usage_details=usage_details,
+            metadata={"status": "success", "latency_ms": latency_ms},
+        )
+    except Exception as exc:
+        logger.warning("Failed to end Langfuse generation (success): %s", exc)
+
+
+def end_llm_generation_error(
+    generation: Any | None,
+    *,
+    error_message: str,
+    latency_ms: int,
+) -> None:
+    if generation is None:
+        return
+    try:
+        generation.end(
+            level="ERROR",
+            status_message=error_message,
+            metadata={"status": "error", "latency_ms": latency_ms},
+        )
+    except Exception as exc:
+        logger.warning("Failed to end Langfuse generation (error): %s", exc)
